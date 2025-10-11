@@ -1,0 +1,22 @@
+TS=$(date +%Y%m%d-%H%M%S); BK=~/vscode-auth-backup-$TS; mkdir -p "$BK"
+for BASE in \
+  "$HOME/.local/share/code-server" \
+  "$HOME/.config/code-server" \
+  "$HOME/.vscode-server" \
+  "$HOME/.vscode"; do
+  if [ -d "$BASE/User" ]; then
+    echo "Backing up $BASE/User to $BK"
+    cp -a "$BASE/User" "$BK"/"$(basename "$BASE")-User"
+    rm -rf "$BASE/User/secrets" 2>/dev/null || true
+    rm -rf "$BASE/User/globalStorage/github.copilot"* 2>/dev/null || true
+    rm -rf "$BASE/User/globalStorage/github.vscode-authentication"* 2>/dev/null || true
+    rm -rf "$BASE/User/globalStorage/GitHub.copilot"* 2>/dev/null || true
+  fi
+done
+echo "Done. Backups in $BK"
+
+
+
+
+
+
