@@ -15,6 +15,10 @@ for BASE in \
 done
 echo "Done. Backups in $BK"
 
+curl -I https://vscode-auth.github.com
+curl -I https://api.githubcopilot.com/_ping
+curl -I https://copilot-proxy.githubusercontent.com/_ping
+curl -I https://api.github.com
 
 
 
