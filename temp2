@@ -1,0 +1,142 @@
+import os, json, textwrap
+
+cfg_path = os.path.expanduser("~/.sparkmagic/config.json")
+print("Config path:", cfg_path, "exists:", os.path.exists(cfg_path))
+
+if os.path.exists(cfg_path):
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+
+    # Show the Livy URL and key session-related bits
+    print("\nkernel_python_credentials:", cfg.get("kernel_python_credentials"))
+    print("\nsession_configs_defaults:", cfg.get("session_configs_defaults"))
+    print("\nsession_configs:", cfg.get("session_configs"))
+    print("\nerror-handling flags:", {
+        "all_errors_are_fatal": cfg.get("all_errors_are_fatal"),
+        "shutdown_session_on_spark_statement_errors": cfg.get("shutdown_session_on_spark_statement_errors"),
+        "cleanup_all_sessions_on_exit": cfg.get("cleanup_all_sessions_on_exit"),
+    })
+else:
+    print("No sparkmagic config.json found – environment may be using built-in defaults.")
+
+
+
+3. Stop sparkmagic from auto-nuking the failing session
+
+You want the session to stay around long enough to inspect its logs with %%info.
+
+Restart the notebook kernel. In the very first cell, before running any %spark commands, do:
+
+import sparkmagic.utils.configuration as conf
+
+conf.override("all_errors_are_fatal", False)
+conf.override("shutdown_session_on_spark_statement_errors", False)
+conf.override("cleanup_all_sessions_on_exit", False)
+
+%load_ext sparkmagic.magics
+
+
+These runtime overrides are the same knobs that exist in config.json, and they control whether sessions get cleaned up on errors or kernel exit.
+GitHub
+
+Now recreate your session (or a new test one):
+
+%spark add -s debug-mp -l python
+
+
+(If your environment requires explicit URL, use the one you saw in kernel_python_credentials["url"]:)
+
+%spark add -s debug-mp -l python -u https://<your-livy-host>:8998
+
+
+Immediately after that, check what sparkmagic thinks:
+
+%spark list
+
+
+If the config overrides worked, you should now see debug-mp (or spark-test-mp) in the list, even if there was an error.
+
+4. Pull the Livy / driver error from inside the notebook
+
+Once you have a saved session, use sparkmagic’s %%info magic to get the logs for that session.
+GitHub
++1
+
+In a new cell:
+
+%%info
+-s debug-mp
+
+
+or if it doesn’t take -s, just:
+
+%%info
+
+
+This prints:
+
+Livy session state (starting, idle, error, dead, etc.)
+
+Spark/YARN app id
+
+Recent stdout/stderr for the session
+
+In the logs, look for:
+
+Tracebacks with SqlContextNotFoundException or the exact “Neither SparkSession nor HiveContext/SqlContext is available” message
+
+Errors related to Python, e.g. bad spark.pyspark.python path, failure to unpack a conda tarball, missing /usr/bin/python3, etc.
+Stack Overflow
++1
+
+This is usually where you discover the real root cause (e.g. cluster-side Python env and/or Spark config problem), which you can’t see from the plain %spark error.
+
+5. Compare “default” vs “custom” session configs
+
+Still from Jupyter, you can test whether your EMR config is the culprit without touching the cluster:
+
+Create a “vanilla” session using only the sparkmagic defaults (no extra properties), as above:
+
+%spark add -s clean-test -l python
+
+
+Then create a session that mimics your EMR config but only for this session:
+
+%spark add -s cfg-test -l python -c '{"conf": {
+    "spark.pyspark.python": "python3"
+    # add only the minimal subset of your custom keys here
+}}'
+
+
+(The -c argument takes a JSON string of Livy session properties; exact details are in sparkmagic docs and %spark?.)
+Stack Overflow
++1
+
+For each session, run:
+
+%%info
+-s clean-test
+
+
+and
+
+%%info
+-s cfg-test
+
+
+If clean-test works but cfg-test fails with the same “Neither SparkSession nor HiveContext/SqlContext is available” error, you’ve confirmed the problem is in the EMR / Livy session configuration (often the Python/conda env settings), not in the notebook or sparkmagic versions.
+
+What’s worth sending back if you want to continue debugging
+
+From the notebook side, the most informative artifacts (that don’t require SSH or AWS console) are:
+
+Output of the config.json inspection cell (with secrets / URLs redacted as needed)
+
+Output of %spark list after the overrides
+
+Output of %%info -s <your-session> – especially the final error stack trace
+
+Those three together are usually enough to say “this is a cluster config issue (e.g. wrong spark.pyspark.python) vs a notebook/sparkmagic wiring problem.”
+
+
+
