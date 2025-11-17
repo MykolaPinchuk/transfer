@@ -140,3 +140,254 @@ Those three together are usually enough to say “this is a cluster config issue
 
 
 
+Given your constraints, the only realistic option is a user-space scheduler that you run yourself on the SageMaker Studio VM. For your use case (non-critical monitoring notebooks), that’s acceptable as long as you’re clear about failure modes.
+
+I’ll outline a concrete pattern you can actually deploy:
+
+---
+
+## 1. What you can rely on in SageMaker Studio
+
+* You can keep a single Studio kernel/VM alive for up to ~1 month by setting idle shutdown accordingly.
+* You have persistent storage attached to that environment.
+* You can run long-lived processes inside that VM (e.g., from a terminal).
+
+That’s enough to run a “poor man’s cron” in Python.
+
+Fundamental limits:
+
+* If the Studio environment is stopped, rebooted, or patched by IT, your scheduler dies.
+* There is no automatic restart without help from infra.
+
+Given your jobs are monitoring/not prod-critical, that’s usually acceptable.
+
+---
+
+## 2. Basic design: `scheduler.py` + config
+
+You keep one scheduler process running, driven by a simple config. Jobs are defined with an interval and a command.
+
+Example config (embed in Python for simplicity):
+
+```python
+# jobs_config.py
+JOBS = [
+    {
+        "name": "hourly_data_drift_check",
+        "command": "/usr/bin/python /home/you/monitors/data_drift.py",
+        "interval_seconds": 3600,  # every hour
+    },
+    {
+        "name": "daily_kpi_report",
+        "command": "/usr/bin/python /home/you/monitors/daily_kpis.py",
+        "interval_seconds": 24 * 3600,  # every day
+    },
+]
+```
+
+Minimal scheduler with:
+
+* Interval-based scheduling (no cron syntax).
+* State file with `last_success` / `last_failure`.
+* “Attention flag” file if anything fails.
+
+```python
+# scheduler.py
+import time
+import json
+import subprocess
+from pathlib import Path
+from jobs_config import JOBS
+
+STATE_FILE = Path.home() / ".monitor_scheduler_state.json"
+ATTENTION_FILE = Path.home() / ".monitor_scheduler_attention.flag"
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {}
+    with STATE_FILE.open() as f:
+        return json.load(f)
+
+def save_state(state):
+    with STATE_FILE.open("w") as f:
+        json.dump(state, f, indent=2)
+
+def mark_attention():
+    ATTENTION_FILE.write_text(
+        f"ATTENTION: monitoring scheduler saw failures. Last update: {time.ctime()}\n"
+    )
+
+def clear_attention():
+    if ATTENTION_FILE.exists():
+        ATTENTION_FILE.unlink()
+
+def main():
+    state = load_state()
+
+    # initialize next_run if missing
+    now = time.time()
+    for job in JOBS:
+        name = job["name"]
+        if name not in state:
+            state[name] = {
+                "next_run": now,
+                "last_success": None,
+                "last_failure": None,
+            }
+    save_state(state)
+
+    while True:
+        now = time.time()
+        had_failure = False
+
+        for job in JOBS:
+            name = job["name"]
+            interval = job["interval_seconds"]
+            job_state = state[name]
+
+            if now >= job_state["next_run"]:
+                # schedule next run (skip catch-up)
+                job_state["next_run"] = now + interval
+                save_state(state)
+
+                log_file = Path.home() / f"{name}.log"
+                with log_file.open("a") as log:
+                    log.write(f"\n=== {time.ctime()} : starting {name} ===\n")
+
+                try:
+                    # Run job synchronously; simple, non-overlapping per scheduler
+                    result = subprocess.run(
+                        job["command"],
+                        shell=True,
+                        stdout=log_file.open("a"),
+                        stderr=subprocess.STDOUT,
+                        timeout=60 * 60,  # 1h max per job; adjust as needed
+                    )
+                    if result.returncode == 0:
+                        job_state["last_success"] = time.time()
+                    else:
+                        job_state["last_failure"] = time.time()
+                        had_failure = True
+                except Exception as e:
+                    with log_file.open("a") as log:
+                        log.write(f"ERROR: {e}\n")
+                    job_state["last_failure"] = time.time()
+                    had_failure = True
+
+                save_state(state)
+
+        if had_failure:
+            mark_attention()
+        else:
+            # If all jobs are healthy this loop, clear the flag
+            clear_attention()
+
+        time.sleep(30)  # scheduler tick; adjust as needed
+
+if __name__ == "__main__":
+    main()
+```
+
+How to run it inside Studio:
+
+```bash
+# in a JupyterLab terminal on that kernel/VM
+cd /home/you/monitoring_scheduler
+python scheduler.py
+```
+
+Ideally from `tmux` if available:
+
+```bash
+tmux new -s scheduler "cd /home/you/monitoring_scheduler && python scheduler.py"
+```
+
+---
+
+## 3. How to hook in notebooks
+
+Best practice: don’t execute `.ipynb` directly; instead:
+
+1. Refactor each monitoring notebook into a Python script:
+
+* Extract the “core” logic into `monitor_x.py` with a `main()` function.
+* Keep the notebook for development/exploration.
+
+2. If you want to continue using notebooks directly, use `papermill` or `nbconvert`:
+
+Example command you put in `jobs_config.py`:
+
+```python
+"command": "papermill /home/you/notebooks/kpi_monitor.ipynb /home/you/notebooks/run_outputs/kpi_monitor-$(date +%F-%H%M).ipynb"
+```
+
+or
+
+```python
+"command": "jupyter nbconvert --to notebook --execute /home/you/notebooks/kpi_monitor.ipynb --output /home/you/notebooks/run_outputs/kpi_monitor-$(date +%F-%H%M).ipynb"
+```
+
+Whether you can install `papermill` or rely on `nbconvert` depends on corporate restrictions.
+
+For reliability and speed, scripts are cleaner:
+
+```python
+"command": "/usr/bin/python /home/you/monitors/kpi_monitor.py"
+```
+
+---
+
+## 4. How you detect failures / get “alerts”
+
+Without email/Slack integration, simplest pattern:
+
+* For each job, you have:
+
+  * `<name>.log` with detailed output.
+  * `STATE_FILE` with last success/failure timestamps.
+* `ATTENTION_FILE` exists if there has been at least one failure since the last healthy loop.
+
+You can then:
+
+* Create a tiny “dashboard” notebook that reads `.monitor_scheduler_state.json` and shows:
+
+  * last success time per job
+  * highlight any with recent `last_failure`
+  * show a warning if `ATTENTION_FILE` exists
+
+You just open that notebook once a day; if something is red, you investigate.
+
+If outbound HTTP is allowed and corporate policy permits:
+
+* Add a simple `send_slack_webhook(message)` call inside `had_failure` branch.
+* Or send to MS Teams / custom internal webhook.
+
+That gives you push alerts instead of “check when you remember.”
+
+---
+
+## 5. Pros and cons of this approach in your setting
+
+Pros:
+
+* Works entirely in your Studio VM, no sudo, no infra support.
+* Easy to reason about: everything is in your home directory and version-controllable.
+* Good enough for non-critical monitoring:
+
+  * hourly/daily checks
+  * low risk if a day is missed
+
+Cons / risks:
+
+* If the Studio kernel/VM is stopped (maintenance, patching, manual stop), scheduler dies and does not restart automatically.
+* If corporate policy kills long-running processes, it dies.
+* There’s no guarantee of “exact” times; it’s “run roughly every N seconds.”
+* You must remember to check state or set up a webhook for real alerts.
+
+Given your description (“not prod; okay if it misses a day”), this is a reasonable tradeoff: much better than manual runs, nowhere near the complexity of Airflow.
+
+If you want, next step can be: define 2–3 concrete monitoring jobs you have today, and I can translate them into specific `jobs_config.py` entries plus recommended script structure.
+
+
+
+
