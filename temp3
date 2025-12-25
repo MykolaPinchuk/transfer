@@ -57,6 +57,180 @@ copilot_tail 200
 * If no `*.done` but `copilot_status` says RUNNING → still running.
 * If no `*.done` and NOT RUNNING → treat as failed/unknown; inspect log.
 
+
+## Long version:
+
+````md
+## Terminal output handling (mandatory)
+
+Copilot often fails to reliably “see” VS Code terminal output and/or detect command completion. Do **not** rely on the terminal UI for state. Do **not** use long sleeps (e.g., `sleep 300`) to guess whether a command finished.
+
+### Rule 0: avoid interactive programs
+Do not run commands that require a TTY or user input (REPLs, `less`, `top/htop`, prompts). Prefer non-interactive flags.
+
+### Rule 1: every non-trivial command must write a log + completion sentinel
+For any command that matters (tests, builds, training, scripts), run it via the wrappers below so we always get:
+- `*.log`  : stdout + stderr
+- `*.pid`  : PID of wrapper job
+- `*.done` : exit code (written exactly once at completion)
+
+This removes ambiguity when:
+- output is buffered or empty
+- a process fails without printing a clear error
+- Copilot can’t see terminal output in real time
+
+### One-time setup (paste into the terminal)
+Use bash syntax. If your shell isn’t bash, run `bash` first.
+
+```bash
+# Optional: reduce pager/ANSI noise
+export PAGER=cat
+export GIT_PAGER=cat
+export SYSTEMD_PAGER=cat
+export AWS_PAGER=""
+export LESS='-FRX'
+export PYTHONUNBUFFERED=1
+
+# Directory for run artifacts
+export COPILOT_LOG_DIR="${COPILOT_LOG_DIR:-/tmp}"
+
+copilot_start() {
+  # Usage: copilot_start <command> [args...]
+  local runid base log pidf donef
+  runid="$(date +%Y%m%d_%H%M%S)"
+  base="${COPILOT_LOG_DIR%/}/copilot_${runid}"
+  log="${base}.log"
+  pidf="${base}.pid"
+  donef="${base}.done"
+
+  rm -f "$donef"
+  : > "$log"
+
+  (
+    "$@"
+    ec=$?
+    echo "$ec" > "$donef"
+    echo "__EXIT_CODE__=$ec" >> "$log"
+  ) > "$log" 2>&1 &
+
+  echo $! > "$pidf"
+  echo "$base" > "${COPILOT_LOG_DIR%/}/copilot-active"
+
+  echo "STARTED: $*"
+  echo "BASE:    $base"
+  echo "LOG:     $log"
+  echo "PIDF:    $pidf"
+  echo "DONEF:   $donef"
+}
+
+copilot_base() {
+  # Prints active base path (or nothing if none)
+  cat "${COPILOT_LOG_DIR%/}/copilot-active" 2>/dev/null
+}
+
+copilot_status() {
+  # Usage: copilot_status [base]
+  local base log pidf donef pid
+  base="${1:-$(copilot_base)}"
+  if [ -z "$base" ]; then
+    echo "NO ACTIVE RUN"
+    return 1
+  fi
+  log="${base}.log"
+  pidf="${base}.pid"
+  donef="${base}.done"
+
+  if [ -f "$donef" ]; then
+    echo "DONE exit_code=$(cat "$donef")"
+  else
+    pid="$(cat "$pidf" 2>/dev/null)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "RUNNING pid=$pid"
+    else
+      echo "NOT RUNNING and no done-file (wrapper interrupted / terminal died?)"
+    fi
+  fi
+  echo "LOG: $log"
+}
+
+copilot_tail() {
+  # Usage: copilot_tail [lines] [base]
+  local lines base
+  lines="${1:-120}"
+  base="${2:-$(copilot_base)}"
+  [ -z "$base" ] && echo "NO ACTIVE RUN" && return 1
+  tail -n "$lines" "${base}.log"
+}
+
+copilot_wait() {
+  # Usage: copilot_wait [base]
+  local base pid
+  base="${1:-$(copilot_base)}"
+  [ -z "$base" ] && echo "NO ACTIVE RUN" && return 1
+  pid="$(cat "${base}.pid" 2>/dev/null)"
+  [ -z "$pid" ] && echo "NO PID FILE" && return 1
+  wait "$pid"
+  copilot_status "$base"
+}
+````
+
+### Standard workflow (what to do every time)
+
+1. Start a run:
+
+```bash
+copilot_start python -u script.py --arg1 foo
+# or
+copilot_start pytest -q
+# or
+copilot_start make test
+```
+
+2. Check status (instead of sleeping):
+
+```bash
+copilot_status
+```
+
+3. Read output (never `cat` huge logs by default):
+
+```bash
+copilot_tail 200
+```
+
+4. If you need to block until completion, use `wait` (not `sleep 300`):
+
+```bash
+copilot_wait
+```
+
+### Interpreting outcomes (do not guess)
+
+* If `*.done` exists: command finished. Read `exit_code`.
+* If no `*.done` but `kill -0 pid` succeeds: command is still running.
+* If no `*.done` and `kill -0 pid` fails: wrapper died or terminal session broke; treat as failed/unknown and inspect the log.
+
+### Debug quick scans (use these before reading the entire log)
+
+```bash
+# last 300 lines
+copilot_tail 300
+
+# common Python error marker
+grep -n "Traceback" "$(copilot_base).log" | tail
+
+# generic error-ish lines (noisy but useful)
+grep -nEi "error|exception|fatal|traceback|failed" "$(copilot_base).log" | tail
+```
+
+### Notes
+
+* Prefer `python -u` (or `PYTHONUNBUFFERED=1`) so logs update promptly.
+* If a tool produces tons of ANSI/progress noise, consider `TERM=dumb` for that command:
+  `copilot_start env TERM=dumb <cmd> ...`
+* This system relies on exit codes. If a program swallows errors and exits `0`, you must add an explicit success marker in the program itself.
+
 ```
 ::contentReference[oaicite:0]{index=0}
 ```
+
