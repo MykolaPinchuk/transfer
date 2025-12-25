@@ -1,0 +1,388 @@
+```markdown
+# Copilot Agent Terminal Framework (VS Code 1.101 / Copilot Chat 0.28)
+
+## Objective
+Make Copilot agent execution reliable **without depending on terminal output**. Treat the terminal as an unreliable launcher. All observability goes to files that the agent reads using `read_file`.
+
+This framework assumes:
+- `run_in_terminal` output may be empty or stale.
+- Each `run_in_terminal` call may start a fresh shell (no persistent functions, no persistent `cd`, no exported vars).
+- Progress bars / in-place output (e.g., tqdm) do not stream reliably.
+
+## Repo layout to add
+Create this directory structure:
+
+```
+
+.copilot/
+run.sh
+lib.sh
+tail.py
+status.py
+README.md
+.gitignore
+
+````
+
+Then `chmod +x .copilot/run.sh`.
+
+---
+
+## Installation steps
+1) Create the files below (exact contents).
+2) `chmod +x .copilot/run.sh`
+3) Do **not** commit logs: `.copilot/.gitignore` handles this.
+
+---
+
+## Agent protocol (critical)
+When the agent needs to run anything:
+
+1) Run the command via the wrapper (terminal output is irrelevant):
+   - `bash .copilot/run.sh "<COMMAND STRING>"`
+
+2) Wait for completion by checking:
+   - `.copilot/latest.done` exists
+
+3) Read results using `read_file` only:
+   - `.copilot/latest.meta`
+   - `.copilot/latest.err`
+   - `.copilot/latest.out`
+
+Do **not** use `cat`, `tail`, `less`, or rely on terminal output.
+
+### Rules for commands
+- Prefer **single simple commands**.
+- Avoid complex `&&`, `$()`, heavy quoting in the tool call itself.
+- Put complexity into a repo script or Make target:
+  - `bash .copilot/run.sh "make gridsearch"`
+  - `bash .copilot/run.sh "python -u scripts/train.py --config cfg.yml"`
+
+---
+
+## File: `.copilot/.gitignore`
+```gitignore
+runs/
+latest.*
+active.json
+status.txt
+tail.txt
+progress.json
+````
+
+---
+
+## File: `.copilot/lib.sh`
+
+```bash
+#!/usr/bin/env bash
+
+copilot_ts() {
+  date -Iseconds
+}
+
+copilot_write_atomic() {
+  # usage: copilot_write_atomic <tmp_path> <final_path>
+  local tmp="$1"
+  local final="$2"
+  mv -f "$tmp" "$final"
+}
+
+copilot_json_escape() {
+  # minimal JSON string escape (good enough for simple paths/strings)
+  sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+```
+
+---
+
+## File: `.copilot/run.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Wrapper contract:
+#   bash .copilot/run.sh "<command string>"
+# Terminal output may be empty; all outputs go to files under .copilot/runs/.
+
+mkdir -p .copilot/runs
+
+cmd="${1:-}"
+if [[ -z "${cmd}" ]]; then
+  echo "Usage: bash .copilot/run.sh \"<command string>\"" >&2
+  exit 2
+fi
+
+# Generate run_id: ISO time + pid (unique enough for local usage)
+run_id="$(date -Iseconds | tr ':+' '__')-$$"
+base=".copilot/runs/${run_id}"
+
+out="${base}.out"
+err="${base}.err"
+meta="${base}.meta"
+done="${base}.done"
+
+# Update 'latest' symlinks (Linux)
+ln -sfn "${run_id}.out"  .copilot/latest.out
+ln -sfn "${run_id}.err"  .copilot/latest.err
+ln -sfn "${run_id}.meta" .copilot/latest.meta
+rm -f .copilot/latest.done
+
+# Write metadata early
+{
+  echo "run_id=${run_id}"
+  echo "start_ts=$(date -Iseconds)"
+  echo "cwd=$(pwd)"
+  echo "cmd=${cmd}"
+  echo "user=$(id -un 2>/dev/null || true)"
+  echo "host=$(hostname 2>/dev/null || true)"
+  echo "uname=$(uname -a 2>/dev/null || true)"
+  if command -v git >/dev/null 2>&1; then
+    echo "git_head=$(git rev-parse HEAD 2>/dev/null || true)"
+    echo "git_status_porcelain=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ' || true)"
+  fi
+} > "$meta"
+
+# Also maintain a persistent "active" state file for the agent to inspect.
+# (This is useful when the terminal tool lies about whether something is running.)
+tmp_active=".copilot/active.json.tmp"
+final_active=".copilot/active.json"
+{
+  echo "{"
+  echo "  \"run_id\": \"${run_id}\","
+  echo "  \"start_ts\": \"$(date -Iseconds)\","
+  echo "  \"cwd\": \"$(pwd | sed 's/\\/\\\\/g')\","
+  echo "  \"out\": \"${out}\","
+  echo "  \"err\": \"${err}\","
+  echo "  \"meta\": \"${meta}\","
+  echo "  \"done\": \"${done}\""
+  echo "}"
+} > "$tmp_active"
+mv -f "$tmp_active" "$final_active"
+
+# Ensure unbuffered-ish behavior for common tools
+export PYTHONUNBUFFERED=1
+export PAGER=cat
+export LESS='-FRX'
+export GIT_PAGER=cat
+export SYSTEMD_PAGER=cat
+export AWS_PAGER=""
+
+# Use line buffering when possible
+stdbuf_cmd=""
+if command -v stdbuf >/dev/null 2>&1; then
+  stdbuf_cmd="stdbuf -oL -eL"
+fi
+
+# Run the command in bash -lc so projects can rely on bash semantics.
+# IMPORTANT: Do not trust terminal output; stdout/stderr are tee'd to files.
+rc=0
+set +e
+(
+  ${stdbuf_cmd} bash -lc "${cmd}"
+) > >(tee -a "$out") 2> >(tee -a "$err" >&2)
+rc=$?
+set -e
+
+# Finalize metadata + done sentinel
+{
+  echo "rc=${rc}"
+  echo "end_ts=$(date -Iseconds)"
+} >> "$meta"
+
+# Done file contains rc on a single line (easy to parse) + points to logs
+{
+  echo "${rc}"
+  echo "out=${out}"
+  echo "err=${err}"
+  echo "meta=${meta}"
+} > "$done"
+
+ln -sfn "${run_id}.done" .copilot/latest.done
+
+exit "$rc"
+```
+
+---
+
+## File: `.copilot/tail.py`
+
+Purpose: create a small tail file the agent can read, avoiding `cat`/`tail` in terminal.
+
+```python
+#!/usr/bin/env python3
+import argparse
+from pathlib import Path
+from collections import deque
+
+def tail_lines(path: Path, n: int) -> str:
+    dq = deque(maxlen=n)
+    with path.open("r", errors="replace") as f:
+        for line in f:
+            dq.append(line)
+    return "".join(dq)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("path")
+    ap.add_argument("--n", type=int, default=200)
+    ap.add_argument("--out", default=".copilot/tail.txt")
+    args = ap.parse_args()
+
+    src = Path(args.path)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    content = tail_lines(src, args.n) if src.exists() else f"[missing file] {src}\n"
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    tmp.write_text(content)
+    tmp.replace(out)
+
+if __name__ == "__main__":
+    main()
+```
+
+Example usage (agent runs via wrapper):
+
+* `bash .copilot/run.sh "python .copilot/tail.py .copilot/latest.err --n 200"`
+
+Then agent reads:
+
+* `.copilot/tail.txt`
+
+---
+
+## File: `.copilot/status.py`
+
+Purpose: generate a deterministic status file for the agent to read (no terminal dependence).
+
+```python
+#!/usr/bin/env python3
+from pathlib import Path
+import os
+
+RUNS_DIR = Path(".copilot/runs")
+OUT = Path(".copilot/status.txt")
+
+def main():
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    runs = sorted(RUNS_DIR.glob("*.meta"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+
+    lines = []
+    lines.append("Last 20 runs (most recent first):\n")
+    for meta in runs:
+        run_id = meta.name.replace(".meta", "")
+        # derive files
+        out = RUNS_DIR / f"{run_id}.out"
+        err = RUNS_DIR / f"{run_id}.err"
+        done = RUNS_DIR / f"{run_id}.done"
+
+        # read rc if done exists
+        rc = "?"
+        if done.exists():
+            try:
+                rc = done.read_text(errors="replace").splitlines()[0].strip()
+            except Exception:
+                rc = "?"
+
+        lines.append(f"- {run_id}  rc={rc}  meta={meta}  out={out}  err={err}")
+
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    tmp = OUT.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, OUT)
+
+if __name__ == "__main__":
+    main()
+```
+
+Example usage (agent runs via wrapper):
+
+* `bash .copilot/run.sh "python .copilot/status.py"`
+
+Then agent reads:
+
+* `.copilot/status.txt`
+
+---
+
+## File: `.copilot/README.md`
+
+```markdown
+# Copilot Agent Execution Protocol
+
+## Do
+- Run commands ONLY via: `bash .copilot/run.sh "<command>"`
+- Wait for completion by checking `.copilot/latest.done` exists.
+- Read outputs ONLY via `read_file`:
+  - `.copilot/latest.meta`
+  - `.copilot/latest.err`
+  - `.copilot/latest.out`
+
+## Do not
+- Do not rely on terminal output text (it may be empty).
+- Do not use `cat`/`tail` in terminal to inspect logs.
+- Do not define shell functions and expect them to persist across calls.
+
+## If output files are huge
+- Generate a tail snapshot:
+  - `bash .copilot/run.sh "python .copilot/tail.py .copilot/latest.err --n 200"`
+  - Read `.copilot/tail.txt`
+
+## For long jobs / grid searches
+Prefer newline logs (no progress bars) OR write a dedicated progress file.
+
+Recommended: write `.copilot/progress.json` atomically from Python so the agent can poll it via `read_file`.
+```
+
+---
+
+## Recommended pattern for long-running Python (to make progress visible)
+
+In your Python code:
+
+* Avoid tqdm/in-place progress bars for agent readability.
+* Print newline logs with `flush=True`.
+* Optionally update `.copilot/progress.json` atomically.
+
+Example snippet:
+
+```python
+import json, os
+from pathlib import Path
+
+def write_progress(d, path=Path(".copilot/progress.json")):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(d, f)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)  # atomic on POSIX
+```
+
+Then the agent can `read_file .copilot/progress.json` whenever it wants.
+
+---
+
+## Minimal instructions to paste into `agents.md` (optional)
+
+If you want to force agent behavior, include this in your repo `agents.md`:
+
+* Terminal output is unreliable. Always run commands via `bash .copilot/run.sh "<cmd>"`.
+* Never use `cat`/`tail` to inspect outputs. Use `read_file` on:
+  `.copilot/latest.meta`, `.copilot/latest.err`, `.copilot/latest.out`, `.copilot/latest.done`.
+* Never rely on persisted shell state/functions across tool calls.
+
+---
+
+```
+
+This is designed so an agent can test it immediately:
+- Run: `bash .copilot/run.sh "python .copilot/status.py"`
+- Read: `.copilot/status.txt`
+- Run any job similarly and inspect `.copilot/latest.*` via `read_file`.
+::contentReference[oaicite:0]{index=0}
+```
