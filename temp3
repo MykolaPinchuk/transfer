@@ -1,0 +1,62 @@
+````md
+## Terminal output handling (mandatory)
+
+Copilot terminal capture is unreliable. Do **not** infer “still running” from terminal UI or log growth. Do **not** use long sleeps (e.g., `sleep 300`) to guess completion.
+
+### Rules
+- Avoid interactive/TTY tools (REPLs, `less`, `top/htop`, prompts). Prefer non-interactive flags.
+- Any non-trivial command (tests/builds/scripts/training) must run via `copilot_start` so we always get:
+  - `*.log`  stdout+stderr
+  - `*.pid`  PID
+  - `*.done` exit code (written on completion)
+
+### One-time setup (paste into terminal; bash syntax)
+```bash
+export COPILOT_LOG_DIR="${COPILOT_LOG_DIR:-/tmp}"
+export PYTHONUNBUFFERED=1 PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat AWS_PAGER="" LESS='-FRX'
+
+copilot_start(){ runid=$(date +%Y%m%d_%H%M%S); base="${COPILOT_LOG_DIR%/}/copilot_${runid}";
+log="$base.log"; pidf="$base.pid"; donef="$base.done"; rm -f "$donef"; :>"$log";
+( "$@"; ec=$?; echo "$ec">"$donef"; echo "__EXIT_CODE__=$ec">>"$log" ) >"$log" 2>&1 & echo $!>"$pidf";
+echo "$base">"${COPILOT_LOG_DIR%/}/copilot-active"; echo "BASE=$base LOG=$log PIDF=$pidf DONEF=$donef"; }
+
+copilot_base(){ cat "${COPILOT_LOG_DIR%/}/copilot-active" 2>/dev/null; }
+copilot_status(){ base="${1:-$(copilot_base)}"; [ -z "$base" ]&&echo "NO ACTIVE RUN"&&return 1;
+log="$base.log"; pidf="$base.pid"; donef="$base.done";
+if [ -f "$donef" ]; then echo "DONE exit_code=$(cat "$donef")"; else pid=$(cat "$pidf" 2>/dev/null);
+kill -0 "$pid" 2>/dev/null && echo "RUNNING pid=$pid" || echo "NOT RUNNING + no done-file (wrapper died?)"; fi; echo "LOG=$log"; }
+
+copilot_tail(){ n="${1:-200}"; base="${2:-$(copilot_base)}"; [ -z "$base" ]&&echo "NO ACTIVE RUN"&&return 1; tail -n "$n" "$base.log"; }
+````
+
+### Usage (always)
+
+Start:
+
+```bash
+copilot_start python -u script.py --args
+# or: copilot_start pytest -q
+# or: copilot_start make test
+```
+
+Check completion (no sleeping):
+
+```bash
+copilot_status
+```
+
+Read output (bounded):
+
+```bash
+copilot_tail 200
+```
+
+### Interpretation (no guessing)
+
+* If `*.done` exists → finished; read exit code.
+* If no `*.done` but `copilot_status` says RUNNING → still running.
+* If no `*.done` and NOT RUNNING → treat as failed/unknown; inspect log.
+
+```
+::contentReference[oaicite:0]{index=0}
+```
